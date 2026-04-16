@@ -1,0 +1,5 @@
+config SENSOR_HUB
+	tristate "Sensor hub driver"
+	depends on GPIOLIB && I2C
+	help
+	  Unified sensor hub driver for PIR + SHT20 and future sensors.

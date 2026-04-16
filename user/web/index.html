@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Sensor Hub 控制台</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #f5f7fb;
+      color: #222;
+    }
+    .wrap {
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+    }
+    h1, h2 {
+      margin-top: 0;
+    }
+    .row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .item {
+      min-width: 180px;
+      padding: 12px;
+      background: #f0f4fa;
+      border-radius: 10px;
+    }
+    .label {
+      font-size: 13px;
+      color: #666;
+      margin-bottom: 6px;
+    }
+    .value {
+      font-size: 20px;
+      font-weight: bold;
+    }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 16px;
+      cursor: pointer;
+      margin-right: 8px;
+      font-size: 14px;
+    }
+    .btn-monitor { background: #2563eb; color: #fff; }
+    .btn-trigger { background: #dc2626; color: #fff; }
+    .btn-refresh { background: #111827; color: #fff; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0f172a;
+      color: #e5e7eb;
+      padding: 12px;
+      border-radius: 10px;
+      min-height: 120px;
+    }
+    img {
+      max-width: 100%;
+      border-radius: 10px;
+      border: 1px solid #ddd;
+      background: #eee;
+    }
+    .hint {
+      color: #666;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Sensor Hub 控制台</h1>
+
+    <div class="card">
+      <h2>模式控制</h2>
+      <button class="btn-monitor" onclick="setMode('monitor')">切换到 Monitor</button>
+      <button class="btn-trigger" onclick="setMode('trigger')">切换到 Trigger</button>
+      <button class="btn-refresh" onclick="refreshAll()">立即刷新</button>
+      <p class="hint">Monitor 模式下显示 MJPEG 实时预览，Trigger 模式下显示最新抓拍图。</p>
+    </div>
+
+    <div class="card">
+      <h2>当前状态</h2>
+      <div class="row">
+        <div class="item">
+          <div class="label">当前模式</div>
+          <div class="value" id="mode">--</div>
+        </div>
+        <div class="item">
+          <div class="label">PIR</div>
+          <div class="value" id="pir">--</div>
+        </div>
+        <div class="item">
+          <div class="label">温度</div>
+          <div class="value" id="temperature">--</div>
+        </div>
+        <div class="item">
+          <div class="label">湿度</div>
+          <div class="value" id="humidity">--</div>
+        </div>
+        <div class="item">
+          <div class="label">最近事件时间</div>
+          <div class="value" id="eventTime" style="font-size:16px;">--</div>
+        </div>
+        <div class="item">
+          <div class="label">抓拍状态</div>
+          <div class="value" id="captureOk">--</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>画面预览</h2>
+      <p class="hint" id="imagePath">--</p>
+      <img id="latestImage" src="" alt="preview" />
+    </div>
+
+    <div class="card">
+      <h2>事件日志</h2>
+      <pre id="logs">加载中...</pre>
+    </div>
+  </div>
+
+  <script>
+    async function fetchText(url, options) {
+      const res = await fetch(url, options || {});
+      if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+      return await res.text();
+    }
+
+    async function fetchJson(url, options) {
+      const res = await fetch(url, options || {});
+      if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+      return await res.json();
+    }
+
+    function updatePreviewByMode(data) {
+      const img = document.getElementById('latestImage');
+      const imagePath = document.getElementById('imagePath');
+
+      if (data.mode === 'monitor') {
+        imagePath.textContent = '/stream.mjpg';
+        img.src = '/stream.mjpg';
+      } else {
+        if (data.last_image && data.last_image.length > 0) {
+          imagePath.textContent = data.last_image;
+          img.src = '/' + data.last_image + '?t=' + Date.now();
+        } else {
+          imagePath.textContent = '暂无图片';
+          img.src = '';
+        }
+      }
+    }
+
+    async function refreshStatus() {
+      try {
+        const data = await fetchJson('/api/status');
+
+        document.getElementById('mode').textContent = data.mode ?? '--';
+        document.getElementById('pir').textContent = String(data.pir ?? '--');
+        document.getElementById('temperature').textContent =
+          data.temperature !== undefined ? `${data.temperature.toFixed(2)} °C` : '--';
+        document.getElementById('humidity').textContent =
+          data.humidity !== undefined ? `${data.humidity.toFixed(2)} %RH` : '--';
+        document.getElementById('eventTime').textContent = data.last_event_time || '--';
+        document.getElementById('captureOk').textContent = data.last_capture_ok ? '成功' : '无/失败';
+
+        updatePreviewByMode(data);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function refreshLogs() {
+      try {
+        const text = await fetchText('/api/logs');
+        document.getElementById('logs').textContent = text || '暂无日志';
+      } catch (err) {
+        console.error(err);
+        document.getElementById('logs').textContent = '日志读取失败';
+      }
+    }
+
+    async function setMode(mode) {
+      try {
+        await fetchJson(`/api/mode?value=${mode}`, { method: 'POST' });
+        await refreshStatus();
+      } catch (err) {
+        console.error(err);
+        alert('模式切换失败');
+      }
+    }
+
+    async function refreshAll() {
+      await refreshStatus();
+      await refreshLogs();
+    }
+
+    refreshAll();
+    setInterval(refreshStatus, 1000);
+    setInterval(refreshLogs, 3000);
+  </script>
+</body>
+</html>
