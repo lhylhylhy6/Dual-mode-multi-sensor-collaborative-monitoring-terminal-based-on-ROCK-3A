@@ -71,7 +71,7 @@ int sensor_client_clear_events(sensor_client_t *cli)
     return ioctl(cli->fd, SH_IOC_CLR_EVENTS);
 }
 
-int sensor_client_force_refresh(sensor_client_t *cli, __u32 sensor_id, __u32 timeout_ms)
+int sensor_client_refresh(sensor_client_t *cli, __u32 sensor_id, __u32 timeout_ms)
 {
     struct sh_refresh_req req;
 
@@ -84,20 +84,20 @@ int sensor_client_force_refresh(sensor_client_t *cli, __u32 sensor_id, __u32 tim
     req.id = sensor_id;
     req.timeout_ms = timeout_ms;
 
-    return ioctl(cli->fd, SH_IOC_FORCE_REFRESH, &req);
+    return ioctl(cli->fd, SH_IOC_REFRESH, &req);
 }
 
-int sensor_client_get_sensor_cfg(sensor_client_t *cli, struct sh_sensor_cfg *cfg)
+int sensor_client_get_cfg(sensor_client_t *cli, struct sh_sensor_cfg *cfg)
 {
     if (!cli || cli->fd < 0 || !cfg) {
         errno = EINVAL;
         return -1;
     }
 
-    return ioctl(cli->fd, SH_IOC_GET_SENSOR_CFG, cfg);
+    return ioctl(cli->fd, SH_IOC_GET_CFG, cfg);
 }
 
-int sensor_client_set_sensor_cfg(sensor_client_t *cli, const struct sh_sensor_cfg *cfg)
+int sensor_client_set_cfg(sensor_client_t *cli, const struct sh_sensor_cfg *cfg)
 {
     struct sh_sensor_cfg tmp;
 
@@ -107,7 +107,35 @@ int sensor_client_set_sensor_cfg(sensor_client_t *cli, const struct sh_sensor_cf
     }
 
     tmp = *cfg;
-    return ioctl(cli->fd, SH_IOC_SET_SENSOR_CFG, &tmp);
+    return ioctl(cli->fd, SH_IOC_SET_CFG, &tmp);
+}
+
+int sensor_client_run_action(sensor_client_t *cli, const struct sh_action_req *req)
+{
+    struct sh_action_req tmp;
+
+    if (!cli || cli->fd < 0 || !req) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    tmp = *req;
+    return ioctl(cli->fd, SH_IOC_DO_ACTION, &tmp);
+}
+
+int sensor_client_force_refresh(sensor_client_t *cli, __u32 sensor_id, __u32 timeout_ms)
+{
+    return sensor_client_refresh(cli, sensor_id, timeout_ms);
+}
+
+int sensor_client_get_sensor_cfg(sensor_client_t *cli, struct sh_sensor_cfg *cfg)
+{
+    return sensor_client_get_cfg(cli, cfg);
+}
+
+int sensor_client_set_sensor_cfg(sensor_client_t *cli, const struct sh_sensor_cfg *cfg)
+{
+    return sensor_client_set_cfg(cli, cfg);
 }
 
 int sensor_client_wait_readable(sensor_client_t *cli, int timeout_ms)

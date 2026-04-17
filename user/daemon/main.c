@@ -25,6 +25,10 @@
 #define MONITOR_FPS                 30
 #define MONITOR_JPEG_QUALITY        75
 #define MONITOR_STATUS_INTERVAL_MS  1000
+#define TRIGGER_STATUS_INTERVAL_MS  1000
+#define BUZZER_DEFAULT_FREQ_HZ      2400
+#define BUZZER_DEFAULT_DUTY_PM      500
+#define BUZZER_DEFAULT_ALERT_MS     180
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -70,6 +74,14 @@ static void format_now(char *buf, size_t len, const char *fmt)
 
     localtime_r(&now, &tm_now);
     strftime(buf, len, fmt, &tm_now);
+}
+
+static uint64_t monotonic_ms_now(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
 }
 
 static void make_capture_paths(char *yuv_path, size_t yuv_len,
@@ -145,6 +157,25 @@ static int snapshot_get_sht20(const struct sh_snapshot *snap, float *temp_c, flo
     return 0;
 }
 
+static int snapshot_get_buzzer(const struct sh_snapshot *snap, int *active, int *freq_hz)
+{
+    const struct sh_sensor_value *v;
+
+    v = sensor_client_find_value(snap, SH_SENSOR_BUZZER);
+    if (!v || v->nvalues < 1) {
+        return -1;
+    }
+
+    if (active) {
+        *active = v->values[0];
+    }
+    if (freq_hz) {
+        *freq_hz = v->nvalues >= 2 ? v->values[1] : 0;
+    }
+
+    return 0;
+}
+
 static void append_event_log(const char *jpg_path, const struct sh_snapshot *snap)
 {
     FILE *fp;
@@ -152,11 +183,13 @@ static void append_event_log(const char *jpg_path, const struct sh_snapshot *sna
     float temp_c = 0.0f;
     float humi_rh = 0.0f;
     int pir_level = 0;
+    int buzzer_active = 0;
 
     format_now(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S");
 
     snapshot_get_sht20(snap, &temp_c, &humi_rh);
     snapshot_get_pir_level(snap, &pir_level);
+    snapshot_get_buzzer(snap, &buzzer_active, NULL);
 
     fp = fopen(OUTPUT_DIR "/events.log", "a");
     if (!fp) {
@@ -165,8 +198,8 @@ static void append_event_log(const char *jpg_path, const struct sh_snapshot *sna
     }
 
     fprintf(fp,
-            "%s MODE=trigger PIR=%d TEMP=%.2fC HUMI=%.2f%%RH IMG=%s\n",
-            ts, pir_level, temp_c, humi_rh, jpg_path);
+            "%s MODE=trigger PIR=%d BUZZER=%d TEMP=%.2fC HUMI=%.2f%%RH IMG=%s\n",
+            ts, pir_level, buzzer_active, temp_c, humi_rh, jpg_path);
 
     fclose(fp);
 }
@@ -174,18 +207,60 @@ static void append_event_log(const char *jpg_path, const struct sh_snapshot *sna
 static void print_snapshot_brief(app_mode_t mode, const struct sh_snapshot *snap)
 {
     int pir_level = 0;
+    int buzzer_active = 0;
+    int buzzer_freq_hz = 0;
     float temp_c = 0.0f;
     float humi_rh = 0.0f;
 
     snapshot_get_pir_level(snap, &pir_level);
     snapshot_get_sht20(snap, &temp_c, &humi_rh);
+    snapshot_get_buzzer(snap, &buzzer_active, &buzzer_freq_hz);
 
-    printf("[STATUS] mode=%s pir=%d temp=%.2fC humi=%.2f%%RH seq=%llu\n",
+    printf("[STATUS] mode=%s pir=%d buzzer=%s@%dHz temp=%.2fC humi=%.2f%%RH seq=%llu\n",
            app_mode_to_str(mode),
            pir_level,
+           buzzer_active ? "on" : "off",
+           buzzer_freq_hz,
            temp_c,
            humi_rh,
            (unsigned long long)snap->seq);
+}
+
+static int refresh_app_snapshot(sensor_client_t *cli,
+                                app_state_t *app,
+                                app_mode_t mode,
+                                int print_brief_status)
+{
+    struct sh_snapshot snap;
+
+    if (sensor_client_get_snapshot(cli, &snap) < 0) {
+        perror("get snapshot");
+        return -1;
+    }
+
+    app_state_update_snapshot(app, &snap);
+    if (print_brief_status) {
+        print_snapshot_brief(mode, &snap);
+    }
+
+    return 0;
+}
+
+static int apply_cfg_checked(sensor_client_t *cli,
+                             const struct sh_sensor_cfg *cfg,
+                             const char *label,
+                             int optional)
+{
+    if (sensor_client_set_cfg(cli, cfg) < 0) {
+        if (optional && (errno == EINVAL || errno == ENODEV)) {
+            return 0;
+        }
+
+        perror(label);
+        return -1;
+    }
+
+    return 0;
 }
 
 static int apply_default_cfg(sensor_client_t *cli)
@@ -196,8 +271,7 @@ static int apply_default_cfg(sensor_client_t *cli)
     cfg.id = SH_SENSOR_PIR;
     cfg.enabled = 1;
     cfg.debounce_ms = 200;
-    if (sensor_client_set_sensor_cfg(cli, &cfg) < 0) {
-        perror("set PIR cfg");
+    if (apply_cfg_checked(cli, &cfg, "set PIR cfg", 0) < 0) {
         return -1;
     }
 
@@ -205,8 +279,17 @@ static int apply_default_cfg(sensor_client_t *cli)
     cfg.id = SH_SENSOR_SHT20;
     cfg.enabled = 1;
     cfg.period_ms = 1000;
-    if (sensor_client_set_sensor_cfg(cli, &cfg) < 0) {
-        perror("set SHT20 cfg");
+    if (apply_cfg_checked(cli, &cfg, "set SHT20 cfg", 0) < 0) {
+        return -1;
+    }
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.id = SH_SENSOR_BUZZER;
+    cfg.enabled = 1;
+    cfg.params[0] = BUZZER_DEFAULT_FREQ_HZ;
+    cfg.params[1] = BUZZER_DEFAULT_DUTY_PM;
+    cfg.params[2] = BUZZER_DEFAULT_ALERT_MS;
+    if (apply_cfg_checked(cli, &cfg, "set BUZZER cfg", 1) < 0) {
         return -1;
     }
 
@@ -221,13 +304,32 @@ static void update_capture_state(app_state_t *app, const char *image_path, int o
     app_state_update_capture(app, image_path, ts, ok);
 }
 
+static void trigger_buzzer_alert(sensor_client_t *cli)
+{
+    struct sh_action_req req;
+
+    memset(&req, 0, sizeof(req));
+    req.id = SH_SENSOR_BUZZER;
+    req.action = SH_ACTION_ALERT;
+
+    if (sensor_client_run_action(cli, &req) < 0) {
+        if (errno == EINVAL || errno == ENODEV || errno == EACCES) {
+            return;
+        }
+
+        perror("run buzzer alert");
+    }
+}
+
 static int handle_trigger(sensor_client_t *cli, camera_ctx_t *cam, app_state_t *app)
 {
     struct sh_snapshot snap;
     char yuv_path[256];
     char jpg_path[256];
 
-    if (sensor_client_force_refresh(cli, SH_SENSOR_SHT20, 0) < 0) {
+    trigger_buzzer_alert(cli);
+
+    if (sensor_client_refresh(cli, SH_SENSOR_SHT20, 0) < 0) {
         perror("force refresh SHT20");
     }
 
@@ -544,6 +646,7 @@ int main(int argc, char **argv)
     app_state_t app;
     http_server_ctx_t http_ctx;
     uint64_t last_monitor_status_ms = 0;
+    uint64_t last_trigger_status_ms = 0;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -559,8 +662,12 @@ int main(int argc, char **argv)
     }
 
     if (sensor_client_get_info(&cli, &info) == 0) {
-        printf("[INFO] sensor_hub version=0x%x sensors=%u qsize=%u\n",
-               info.version, info.sensor_count, info.queue_size);
+        printf("[INFO] sensor_hub version=0x%x endpoints=%u inputs=%u outputs=%u qsize=%u\n",
+               info.version,
+               info.sensor_count,
+               info.input_count,
+               info.output_count,
+               info.queue_size);
     }
 
     if (apply_default_cfg(&cli) < 0) {
@@ -575,6 +682,7 @@ int main(int argc, char **argv)
     }
 
     app_state_set_mode(&app, start_mode);
+    refresh_app_snapshot(&cli, &app, start_mode, 0);
 
     memset(&http_ctx, 0, sizeof(http_ctx));
     http_ctx.state = &app;
@@ -680,22 +788,12 @@ int main(int argc, char **argv)
 		}
 
         if (active_mode == APP_MODE_MONITOR) {
-            struct timespec ts;
             uint64_t now_ms;
 
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+            now_ms = monotonic_ms_now();
 
             if (now_ms - last_monitor_status_ms >= MONITOR_STATUS_INTERVAL_MS) {
-                struct sh_snapshot snap;
-
-                if (sensor_client_get_snapshot(&cli, &snap) == 0) {
-                    app_state_update_snapshot(&app, &snap);
-                    print_snapshot_brief(APP_MODE_MONITOR, &snap);
-                } else {
-                    perror("get snapshot");
-                }
-
+                refresh_app_snapshot(&cli, &app, APP_MODE_MONITOR, 1);
                 last_monitor_status_ms = now_ms;
             }
 
@@ -704,6 +802,13 @@ int main(int argc, char **argv)
             struct sh_event events[16];
             ssize_t n;
             int ret;
+            uint64_t now_ms = monotonic_ms_now();
+
+            if (now_ms - last_trigger_status_ms >= TRIGGER_STATUS_INTERVAL_MS) {
+                if (refresh_app_snapshot(&cli, &app, APP_MODE_TRIGGER, 0) == 0) {
+                    last_trigger_status_ms = now_ms;
+                }
+            }
 
             ret = sensor_client_wait_readable(&cli, 200);
             if (ret < 0) {
@@ -722,6 +827,10 @@ int main(int argc, char **argv)
                     break;
                 }
                 continue;
+            }
+
+            if (refresh_app_snapshot(&cli, &app, APP_MODE_TRIGGER, 0) == 0) {
+                last_trigger_status_ms = monotonic_ms_now();
             }
 
             for (ssize_t i = 0; i < n; ++i) {

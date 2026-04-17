@@ -2,6 +2,13 @@
 /plugin/;
 
 / {
+		metadata {
+			title = "Sensor Hub With PWM9 Buzzer";
+			compatible = "radxa,rock-3a";
+			category = "misc";
+			description = "Enable the custom sensor hub with PIR, SHT20, and a passive buzzer on PWM9_M0 (PIN18). This overlay expects rk3568-pwm9-m0 to be enabled as well.";
+		};
+
 	fragment@0 {
 		target-path = "/";
 		__overlay__ {
@@ -15,6 +22,16 @@
 				/* SHT20 */
 				sht20-bus-num = <2>;
 				sht20-addr = <0x40>;
+
+				/* Passive buzzer on PWM9_M0 / PIN18.
+				 * rk3568-pwm9-m0 still needs to be enabled in the
+				 * board overlay list so the controller pinmux is active.
+				 */
+				pwms = <&pwm9 0 416667 0>;
+				pwm-names = "buzzer";
+				buzzer-default-freq-hz = <2400>;
+				buzzer-default-duty-permille = <500>;
+				buzzer-default-duration-ms = <180>;
 			};
 		};
 	};

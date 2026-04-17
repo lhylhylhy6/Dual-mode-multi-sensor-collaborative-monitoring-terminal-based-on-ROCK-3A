@@ -12,11 +12,12 @@ struct sh_sht20_priv {
 	struct i2c_adapter *adap;
 	struct i2c_client *client;
 	struct delayed_work work;
+	struct mutex io_lock;
 
 	u32 bus_num;
 	u16 addr;
 
-	struct sh_sensor *sensor;
+	struct sh_endpoint *endpoint;
 };
 
 static int sh_sht20_do_sample(struct sh_sht20_priv *priv, s32 *temp_mc, s32 *humi_mrh)
@@ -57,40 +58,27 @@ static int sh_sht20_do_sample(struct sh_sht20_priv *priv, s32 *temp_mc, s32 *hum
 	return 0;
 }
 
-static int sh_sht20_refresh(struct sh_core *hub, struct sh_sensor *sensor)
+static int sh_sht20_refresh(struct sh_core *hub, struct sh_endpoint *endpoint)
 {
-	struct sh_sht20_priv *priv = sensor->priv;
+	struct sh_sht20_priv *priv = endpoint->priv;
 	struct sh_sensor_value val;
-	//struct sh_event evt;
 	s32 temp_mc, humi_mrh;
 	int ret;
 
+	mutex_lock(&priv->io_lock);
 	ret = sh_sht20_do_sample(priv, &temp_mc, &humi_mrh);
+	mutex_unlock(&priv->io_lock);
 	if (ret)
 		return ret;
 
-	memset(&val, 0, sizeof(val));
-	val.id = SH_SENSOR_SHT20;
-	val.type = SH_TYPE_ENV;
-	val.flags = SH_FLAG_ENABLED | SH_FLAG_VALID | SH_FLAG_ONLINE;
-	val.nvalues = 2;
-	val.timestamp_ns = ktime_get_ns();
+	sh_init_value(endpoint, &val,
+		      (endpoint->cfg.enabled ? SH_FLAG_ENABLED : 0) |
+		      SH_FLAG_VALID | SH_FLAG_ONLINE,
+		      2);
 	val.values[0] = temp_mc;
 	val.values[1] = humi_mrh;
 
-	sh_update_sensor_value(hub, sensor, &val);
-
-/* 	memset(&evt, 0, sizeof(evt));
-	evt.type = SH_EVT_SENSOR;
-	evt.sensor_id = SH_SENSOR_SHT20;
-	evt.code = SH_CODE_SAMPLE;
-	evt.flags = SH_FLAG_VALID;
-	evt.nvalues = 2;
-	evt.timestamp_ns = val.timestamp_ns;
-	evt.values[0] = temp_mc;
-	evt.values[1] = humi_mrh;
-
-	sh_push_event(hub, &evt); */
+	sh_update_endpoint_value(hub, endpoint, &val);
 	return 0;
 }
 
@@ -98,41 +86,53 @@ static void sh_sht20_workfn(struct work_struct *work)
 {
 	struct sh_sht20_priv *priv =
 		container_of(to_delayed_work(work), struct sh_sht20_priv, work);
-	struct sh_sensor *sensor = priv->sensor;
+	struct sh_endpoint *endpoint = priv->endpoint;
 
-	if (!sensor || !sensor->cfg.enabled)
+	if (!endpoint || !endpoint->cfg.enabled)
 		return;
 
-	sh_sht20_refresh(priv->hub, sensor);
+	sh_sht20_refresh(priv->hub, endpoint);
 
-	if (sensor->cfg.enabled && sensor->cfg.period_ms)
+	if (endpoint->cfg.enabled && endpoint->cfg.period_ms)
 		schedule_delayed_work(&priv->work,
-				      msecs_to_jiffies(sensor->cfg.period_ms));
+				      msecs_to_jiffies(endpoint->cfg.period_ms));
 }
 
 static int sh_sht20_apply_cfg(struct sh_core *hub,
-			      struct sh_sensor *sensor,
+			      struct sh_endpoint *endpoint,
 			      const struct sh_sensor_cfg *cfg)
 {
-	struct sh_sht20_priv *priv = sensor->priv;
+	struct sh_sht20_priv *priv = endpoint->priv;
+	struct sh_sensor_value val;
 
 	mutex_lock(&hub->lock);
-	sensor->cfg.enabled = cfg->enabled;
-	sensor->cfg.period_ms = cfg->period_ms ? cfg->period_ms : 1000;
-	memcpy(sensor->cfg.thresh_hi, cfg->thresh_hi, sizeof(sensor->cfg.thresh_hi));
-	memcpy(sensor->cfg.thresh_lo, cfg->thresh_lo, sizeof(sensor->cfg.thresh_lo));
+	endpoint->cfg.enabled = cfg->enabled;
+	endpoint->cfg.period_ms = cfg->period_ms ? cfg->period_ms : 1000;
+	memcpy(endpoint->cfg.params, cfg->params, sizeof(endpoint->cfg.params));
+	memcpy(endpoint->cfg.thresh_hi, cfg->thresh_hi, sizeof(endpoint->cfg.thresh_hi));
+	memcpy(endpoint->cfg.thresh_lo, cfg->thresh_lo, sizeof(endpoint->cfg.thresh_lo));
 	mutex_unlock(&hub->lock);
 
 	cancel_delayed_work_sync(&priv->work);
-	if (sensor->cfg.enabled)
+	if (endpoint->cfg.enabled)
 		schedule_delayed_work(&priv->work, 0);
+
+	val = endpoint->value;
+	val.flags &= ~SH_FLAG_ENABLED;
+	if (cfg->enabled)
+		val.flags |= SH_FLAG_ENABLED;
+	val.timestamp_ns = ktime_get_ns();
+	sh_update_endpoint_value(hub, endpoint, &val);
+	sh_emit_event(hub, endpoint, SH_EVT_CONFIG,
+		      cfg->enabled ? SH_CODE_ENABLE : SH_CODE_DISABLE,
+		      val.flags, &val);
 
 	return 0;
 }
 
-static void sh_sht20_remove_sensor(struct sh_core *hub, struct sh_sensor *sensor)
+static void sh_sht20_remove_sensor(struct sh_core *hub, struct sh_endpoint *endpoint)
 {
-	struct sh_sht20_priv *priv = sensor->priv;
+	struct sh_sht20_priv *priv = endpoint->priv;
 
 	cancel_delayed_work_sync(&priv->work);
 
@@ -143,7 +143,7 @@ static void sh_sht20_remove_sensor(struct sh_core *hub, struct sh_sensor *sensor
 		i2c_put_adapter(priv->adap);
 }
 
-static const struct sh_sensor_ops sh_sht20_ops = {
+static const struct sh_endpoint_ops sh_sht20_ops = {
 	.refresh   = sh_sht20_refresh,
 	.apply_cfg = sh_sht20_apply_cfg,
 	.remove    = sh_sht20_remove_sensor,
@@ -152,8 +152,8 @@ static const struct sh_sensor_ops sh_sht20_ops = {
 int sh_sht20_register(struct sh_core *hub)
 {
 	struct sh_sht20_priv *priv;
-	struct sh_sensor tmpl = { 0 };
-	struct sh_sensor *sensor;
+	struct sh_endpoint tmpl = { 0 };
+	struct sh_endpoint *endpoint;
 	struct i2c_board_info info = { };
 	struct sh_sensor_value val = { 0 };
 	u32 bus_num = 2;
@@ -170,6 +170,7 @@ int sh_sht20_register(struct sh_core *hub)
 	priv->hub = hub;
 	priv->bus_num = bus_num;
 	priv->addr = addr;
+	mutex_init(&priv->io_lock);
 
 	priv->adap = i2c_get_adapter(priv->bus_num);
 	if (!priv->adap)
@@ -190,6 +191,8 @@ int sh_sht20_register(struct sh_core *hub)
 	memset(&tmpl, 0, sizeof(tmpl));
 	tmpl.id = SH_SENSOR_SHT20;
 	tmpl.type = SH_TYPE_ENV;
+	tmpl.direction = SH_DIR_INPUT;
+	tmpl.caps = SH_CAP_REFRESH | SH_CAP_CFG;
 	strscpy(tmpl.name, "sht20", sizeof(tmpl.name));
 	tmpl.cfg.id = SH_SENSOR_SHT20;
 	tmpl.cfg.enabled = 1;
@@ -197,29 +200,25 @@ int sh_sht20_register(struct sh_core *hub)
 	tmpl.ops = &sh_sht20_ops;
 	tmpl.priv = priv;
 
-	sensor = sh_register_sensor(hub, &tmpl);
-	if (!sensor)
+	endpoint = sh_register_endpoint(hub, &tmpl);
+	if (!endpoint)
 		return -ENOMEM;
 
-	priv->sensor = sensor;
+	priv->endpoint = endpoint;
 	INIT_DELAYED_WORK(&priv->work, sh_sht20_workfn);
 
-	val.id = SH_SENSOR_SHT20;
-	val.type = SH_TYPE_ENV;
-	val.flags = SH_FLAG_ENABLED;
-	val.nvalues = 2;
-	val.timestamp_ns = ktime_get_ns();
+	sh_init_value(endpoint, &val, SH_FLAG_ENABLED, 2);
 	val.values[0] = 0;
 	val.values[1] = 0;
 
-	sh_update_sensor_value(hub, sensor, &val);
+	sh_update_endpoint_value(hub, endpoint, &val);
 
-	ret = sh_sht20_refresh(hub, sensor);
+	ret = sh_sht20_refresh(hub, endpoint);
 	if (ret)
 		dev_warn(hub->dev, "initial SHT20 refresh failed: %d\n", ret);
 
 	schedule_delayed_work(&priv->work,
-			      msecs_to_jiffies(sensor->cfg.period_ms));
+			      msecs_to_jiffies(endpoint->cfg.period_ms));
 
 	dev_info(hub->dev, "SHT20 registered on i2c-%u addr=0x%02x\n",
 		 priv->bus_num, priv->addr);
@@ -228,4 +227,5 @@ int sh_sht20_register(struct sh_core *hub)
 
 void sh_sht20_unregister(struct sh_core *hub)
 {
+	sh_unregister_endpoint(hub, sh_find_endpoint(hub, SH_SENSOR_SHT20));
 }

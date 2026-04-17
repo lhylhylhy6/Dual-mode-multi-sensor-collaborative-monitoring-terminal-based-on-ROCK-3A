@@ -54,45 +54,95 @@ int sh_push_event(struct sh_core *hub, struct sh_event *evt)
 }
 EXPORT_SYMBOL_GPL(sh_push_event);
 
-struct sh_sensor *sh_find_sensor(struct sh_core *hub, u32 id)
+struct sh_endpoint *sh_find_endpoint(struct sh_core *hub, u32 id)
 {
 	u32 i;
 
-	for (i = 0; i < hub->sensor_count; i++) {
-		if (hub->sensors[i].registered && hub->sensors[i].id == id)
-			return &hub->sensors[i];
+	for (i = 0; i < hub->endpoint_count; i++) {
+		if (hub->endpoints[i].registered && hub->endpoints[i].id == id)
+			return &hub->endpoints[i];
 	}
 
 	return NULL;
 }
-EXPORT_SYMBOL_GPL(sh_find_sensor);
+EXPORT_SYMBOL_GPL(sh_find_endpoint);
 
-struct sh_sensor *sh_register_sensor(struct sh_core *hub,
-				     const struct sh_sensor *tmpl)
+struct sh_endpoint *sh_register_endpoint(struct sh_core *hub,
+					 const struct sh_endpoint *tmpl)
 {
-	struct sh_sensor *dst;
+	struct sh_endpoint *dst;
 
-	if (hub->sensor_count >= SH_MAX_SENSORS)
+	if (hub->endpoint_count >= SH_MAX_SENSORS)
 		return NULL;
 
-	dst = &hub->sensors[hub->sensor_count++];
+	dst = &hub->endpoints[hub->endpoint_count++];
 	*dst = *tmpl;
 	dst->registered = true;
 
 	return dst;
 }
-EXPORT_SYMBOL_GPL(sh_register_sensor);
+EXPORT_SYMBOL_GPL(sh_register_endpoint);
 
-void sh_update_sensor_value(struct sh_core *hub,
-			    struct sh_sensor *sensor,
-			    const struct sh_sensor_value *val)
+void sh_unregister_endpoint(struct sh_core *hub, struct sh_endpoint *endpoint)
+{
+	if (!endpoint || !endpoint->registered)
+		return;
+
+	if (endpoint->ops && endpoint->ops->remove)
+		endpoint->ops->remove(hub, endpoint);
+
+	endpoint->registered = false;
+}
+EXPORT_SYMBOL_GPL(sh_unregister_endpoint);
+
+void sh_init_value(struct sh_endpoint *endpoint,
+		   struct sh_sensor_value *val,
+		   u32 flags,
+		   u32 nvalues)
+{
+	memset(val, 0, sizeof(*val));
+	val->id = endpoint->id;
+	val->type = endpoint->type;
+	val->direction = endpoint->direction;
+	val->flags = flags;
+	val->caps = endpoint->caps;
+	val->nvalues = nvalues;
+	val->timestamp_ns = ktime_get_ns();
+}
+EXPORT_SYMBOL_GPL(sh_init_value);
+
+void sh_emit_event(struct sh_core *hub,
+		   struct sh_endpoint *endpoint,
+		   u32 evt_type,
+		   u32 code,
+		   u32 evt_flags,
+		   const struct sh_sensor_value *val)
+{
+	struct sh_event evt;
+
+	memset(&evt, 0, sizeof(evt));
+	evt.type = evt_type;
+	evt.sensor_id = endpoint->id;
+	evt.code = code;
+	evt.flags = evt_flags;
+	evt.nvalues = min_t(u32, val->nvalues, SH_MAX_VALUES);
+	evt.timestamp_ns = val->timestamp_ns;
+	memcpy(evt.values, val->values, sizeof(evt.values));
+
+	sh_push_event(hub, &evt);
+}
+EXPORT_SYMBOL_GPL(sh_emit_event);
+
+void sh_update_endpoint_value(struct sh_core *hub,
+			      struct sh_endpoint *endpoint,
+			      const struct sh_sensor_value *val)
 {
 	mutex_lock(&hub->lock);
-	sensor->value = *val;
+	endpoint->value = *val;
 	hub->snapshot_seq++;
 	mutex_unlock(&hub->lock);
 }
-EXPORT_SYMBOL_GPL(sh_update_sensor_value);
+EXPORT_SYMBOL_GPL(sh_update_endpoint_value);
 
 void sh_fill_snapshot(struct sh_core *hub, struct sh_snapshot *snap)
 {
@@ -106,10 +156,10 @@ void sh_fill_snapshot(struct sh_core *hub, struct sh_snapshot *snap)
 
 	mutex_lock(&hub->lock);
 
-	for (i = 0; i < hub->sensor_count && out < SH_MAX_SENSORS; i++) {
-		if (!hub->sensors[i].registered)
+	for (i = 0; i < hub->endpoint_count && out < SH_MAX_SENSORS; i++) {
+		if (!hub->endpoints[i].registered)
 			continue;
-		snap->items[out++] = hub->sensors[i].value;
+		snap->items[out++] = hub->endpoints[i].value;
 	}
 
 	snap->count = out;
@@ -184,22 +234,40 @@ static long sh_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct sh_hub_info info;
 	struct sh_snapshot snap;
 	struct sh_refresh_req req;
+	struct sh_action_req action;
 	struct sh_sensor_cfg cfg;
-	struct sh_sensor *sensor;
+	struct sh_endpoint *endpoint;
 
 	switch (cmd) {
 	case SH_IOC_GET_INFO:
+		{
+			u32 i;
+
 		memset(&info, 0, sizeof(info));
 		info.version = SH_API_VERSION;
-		info.sensor_count = hub->sensor_count;
+		info.sensor_count = hub->endpoint_count;
 		info.queue_size = SH_EVT_Q_SIZE;
 		info.queue_depth = hub->q.count;
 		info.event_seq = hub->event_seq;
 		info.snapshot_seq = hub->snapshot_seq;
 
+		mutex_lock(&hub->lock);
+		for (i = 0; i < hub->endpoint_count; i++) {
+			if (!hub->endpoints[i].registered)
+				continue;
+			if (hub->endpoints[i].direction == SH_DIR_INPUT ||
+			    hub->endpoints[i].direction == SH_DIR_BIDIR)
+				info.input_count++;
+			if (hub->endpoints[i].direction == SH_DIR_OUTPUT ||
+			    hub->endpoints[i].direction == SH_DIR_BIDIR)
+				info.output_count++;
+		}
+		mutex_unlock(&hub->lock);
+
 		if (copy_to_user(argp, &info, sizeof(info)))
 			return -EFAULT;
 		return 0;
+		}
 
 	case SH_IOC_GET_SNAPSHOT:
 		sh_fill_snapshot(hub, &snap);
@@ -223,21 +291,21 @@ static long sh_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&req, argp, sizeof(req)))
 			return -EFAULT;
 
-		sensor = sh_find_sensor(hub, req.id);
-		if (!sensor || !sensor->ops || !sensor->ops->refresh)
+		endpoint = sh_find_endpoint(hub, req.id);
+		if (!endpoint || !endpoint->ops || !endpoint->ops->refresh)
 			return -EINVAL;
 
-		return sensor->ops->refresh(hub, sensor);
+		return endpoint->ops->refresh(hub, endpoint);
 
 	case SH_IOC_GET_SENSOR_CFG:
 		if (copy_from_user(&cfg, argp, sizeof(cfg)))
 			return -EFAULT;
 
-		sensor = sh_find_sensor(hub, cfg.id);
-		if (!sensor)
+		endpoint = sh_find_endpoint(hub, cfg.id);
+		if (!endpoint)
 			return -EINVAL;
 
-		cfg = sensor->cfg;
+		cfg = endpoint->cfg;
 		if (copy_to_user(argp, &cfg, sizeof(cfg)))
 			return -EFAULT;
 		return 0;
@@ -246,11 +314,21 @@ static long sh_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&cfg, argp, sizeof(cfg)))
 			return -EFAULT;
 
-		sensor = sh_find_sensor(hub, cfg.id);
-		if (!sensor || !sensor->ops || !sensor->ops->apply_cfg)
+		endpoint = sh_find_endpoint(hub, cfg.id);
+		if (!endpoint || !endpoint->ops || !endpoint->ops->apply_cfg)
 			return -EINVAL;
 
-		return sensor->ops->apply_cfg(hub, sensor, &cfg);
+		return endpoint->ops->apply_cfg(hub, endpoint, &cfg);
+
+	case SH_IOC_RUN_ACTION:
+		if (copy_from_user(&action, argp, sizeof(action)))
+			return -EFAULT;
+
+		endpoint = sh_find_endpoint(hub, action.id);
+		if (!endpoint || !endpoint->ops || !endpoint->ops->dispatch)
+			return -EINVAL;
+
+		return endpoint->ops->dispatch(hub, endpoint, &action);
 
 	default:
 		return -ENOTTY;
@@ -300,9 +378,15 @@ static int sh_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_pir;
 
+	ret = sh_buzzer_register(hub);
+	if (ret)
+		goto err_sht20;
+
 	dev_info(&pdev->dev, "sensor_hub probed\n");
 	return 0;
 
+err_sht20:
+	sh_sht20_unregister(hub);
 err_pir:
 	sh_pir_unregister(hub);
 err_misc:
@@ -315,14 +399,15 @@ static int sh_remove(struct platform_device *pdev)
 	struct sh_core *hub = platform_get_drvdata(pdev);
 	u32 i;
 
+	sh_buzzer_unregister(hub);
 	sh_sht20_unregister(hub);
 	sh_pir_unregister(hub);
 
-	for (i = 0; i < hub->sensor_count; i++) {
-		if (hub->sensors[i].registered &&
-		    hub->sensors[i].ops &&
-		    hub->sensors[i].ops->remove) {
-			hub->sensors[i].ops->remove(hub, &hub->sensors[i]);
+	for (i = 0; i < hub->endpoint_count; i++) {
+		if (hub->endpoints[i].registered &&
+		    hub->endpoints[i].ops &&
+		    hub->endpoints[i].ops->remove) {
+			hub->endpoints[i].ops->remove(hub, &hub->endpoints[i]);
 		}
 	}
 
@@ -349,4 +434,4 @@ module_platform_driver(sh_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("OpenAI + lhy");
-MODULE_DESCRIPTION("Unified sensor hub driver for PIR + SHT20");
+MODULE_DESCRIPTION("Unified hub driver for PIR + SHT20 + PWM buzzer");

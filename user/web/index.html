@@ -102,6 +102,10 @@
           <div class="value" id="pir">--</div>
         </div>
         <div class="item">
+          <div class="label">蜂鸣器</div>
+          <div class="value" id="buzzer">--</div>
+        </div>
+        <div class="item">
           <div class="label">温度</div>
           <div class="value" id="temperature">--</div>
         </div>
@@ -169,6 +173,14 @@
 
         document.getElementById('mode').textContent = data.mode ?? '--';
         document.getElementById('pir').textContent = String(data.pir ?? '--');
+        if (data.buzzer_active === undefined) {
+          document.getElementById('buzzer').textContent = '--';
+        } else if (data.buzzer_active) {
+          document.getElementById('buzzer').textContent =
+            `鸣叫中 ${data.buzzer_freq_hz || 0} Hz`;
+        } else {
+          document.getElementById('buzzer').textContent = '空闲';
+        }
         document.getElementById('temperature').textContent =
           data.temperature !== undefined ? `${data.temperature.toFixed(2)} °C` : '--';
         document.getElementById('humidity').textContent =

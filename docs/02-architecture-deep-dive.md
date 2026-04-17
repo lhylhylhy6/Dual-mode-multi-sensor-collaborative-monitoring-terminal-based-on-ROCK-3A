@@ -2,9 +2,9 @@
 
 ## 1. 阅读这份文档前，先记住三个结论
 
-### 1.1 这是一个“统一传感器入口”的系统
+### 1.1 这是一个“统一端点入口”的系统
 
-用户态并不直接分别操作 GPIO 和 I2C，而是统一访问 `/dev/sensor_hub`。这是这个项目最核心的架构选择。
+用户态并不直接分别操作 GPIO、I2C 和 PWM，而是统一访问 `/dev/sensor_hub`。这是这个项目最核心的架构选择。
 
 ### 1.2 `monitor` 和 `trigger` 使用了两套不同的图像链路
 
@@ -29,6 +29,7 @@ kernel/
     sensor_hub_core.c
     sensor_hub_pir.c
     sensor_hub_sht20.c
+    sensor_hub_buzzer.c
 
 user/
   daemon/
@@ -50,6 +51,7 @@ user/
 - `sensor_hub_core.c`：驱动核心框架
 - `sensor_hub_pir.c`：PIR 接入与中断事件
 - `sensor_hub_sht20.c`：SHT20 接入与周期采样
+- `sensor_hub_buzzer.c`：PWM 蜂鸣器接入与输出动作
 - `sensor_client.c`：用户态访问驱动的薄封装
 - `camera_v4l2.c`：摄像头生命周期与采集接口
 - `app_state.c`：系统状态中心
@@ -63,15 +65,17 @@ user/
 `kernel/overlay/sensor-hub-overlay.dts` 做了两件事：
 
 - 创建一个 `compatible = "poozoo,sensor-hub"` 的 platform device
-- 把 PIR GPIO 和 SHT20 的 I2C 总线信息通过属性传给驱动
+- 把 PIR GPIO、SHT20 的 I2C 总线信息，以及蜂鸣器 PWM 和默认参数通过属性传给驱动
 
 属性包括：
 
 - `pir-gpios = <&gpio3 5 0>`
 - `sht20-bus-num = <2>`
 - `sht20-addr = <0x40>`
+- `pwms = <&pwm9 0 416667 0>`
+- `pwm-names = "buzzer"`
 
-也就是说，驱动不是硬编码地去猜设备在哪，而是通过 DT 属性获取硬件描述。
+这里的蜂鸣器被固定接到 `PWM9_M0 / PIN18`。也就是说，驱动不是硬编码地去猜设备在哪，而是通过 DT 属性获取硬件描述。
 
 ## 3.2 `sensor_hub` 驱动核心
 
@@ -93,6 +97,7 @@ user/
 - `ioctl(GET_SNAPSHOT)`：读取全量状态快照
 - `ioctl(FORCE_REFRESH)`：强制刷新指定传感器
 - `ioctl(GET/SET_SENSOR_CFG)`：读写单个传感器配置
+- `ioctl(RUN_ACTION)`：对输出端点下发动作
 
 ### 3.2.2 两套数据模型
 
@@ -114,6 +119,7 @@ user/
 
 - 有版本号 `SH_API_VERSION`
 - 有统一的 `sensor id` / `sensor type` / `event code`
+- 有统一的 `direction` / `caps`，同一套结构既能描述输入，也能描述输出
 - 使用定点整数而不是浮点数，避免内核和用户态共享结构里使用 `float`
 - 支持最多 16 个传感器和每个传感器最多 4 个数值
 - 为将来扩展光照、烟雾、门磁等设备预留了 ID
@@ -228,6 +234,32 @@ PIR 模块维护了：
 
 对于这个项目的双模式目标来说，这个取舍是合理的。
 
+## 3.5 蜂鸣器子模块
+
+`sensor_hub_buzzer.c` 负责 PWM 无源蜂鸣器接入。
+
+### 3.5.1 初始化过程
+
+初始化时，驱动会：
+
+1. 通过 `devm_pwm_get(..., "buzzer")` 获取 PWM 控制器
+2. 从设备树读取默认频率、占空比、时长
+3. 注册为 `SH_SENSOR_BUZZER`
+4. 把它声明成 `direction = SH_DIR_OUTPUT`
+5. 在 snapshot 中暴露当前 `active/freq/duration/duty`
+
+如果板端没有启用 `rk3568-pwm9-m0`，或者 overlay 里没有 `pwms`，这个模块会优雅跳过，不影响 PIR 和 SHT20 正常工作。
+
+### 3.5.2 动作模型
+
+蜂鸣器不走 `FORCE_REFRESH`，而是走统一动作接口：
+
+- `SH_ACTION_ALERT`
+- `SH_ACTION_PULSE`
+- `SH_ACTION_STOP`
+
+收到 `ALERT/PULSE` 后，驱动会配置 PWM、更新 snapshot，并在 `duration_ms` 到期后通过 `delayed_work` 自动关闭，同时补一条 `OUTPUT_OFF` 事件。
+
 ## 4. 用户态守护进程设计
 
 ## 4.1 `sensor_client.c`：驱动访问适配层
@@ -287,7 +319,7 @@ PIR 模块维护了：
 
 - 启动时初始化输出目录
 - 打开 `/dev/sensor_hub`
-- 下发 PIR/SHT20 默认配置
+- 下发 PIR/SHT20/蜂鸣器默认配置
 - 初始化应用状态
 - 启动 HTTP 服务
 - 根据模式打开摄像头
@@ -316,6 +348,7 @@ trigger
 
 - PIR：`enabled=1`，`debounce_ms=200`
 - SHT20：`enabled=1`，`period_ms=1000`
+- BUZZER：`enabled=1`，默认 `2400Hz / 50% duty / 180ms`
 
 这说明用户态对驱动并不是“只读访问”，而是会主动配置底层行为。
 
@@ -345,15 +378,16 @@ trigger
 
 收到 PIR 事件后，`handle_trigger()` 会执行：
 
-1. `FORCE_REFRESH(SHT20)`
-2. `GET_SNAPSHOT`
-3. 更新应用状态
-4. 生成带时间戳的输出文件名
-5. 从摄像头抓取一帧原始 NV12 数据
-6. 调用 `ffmpeg` 转成 JPG
-7. 删除中间 `.yuv`
-8. 更新最近抓拍状态
-9. 追加写入 `events.log`
+1. `RUN_ACTION(BUZZER, ALERT)`
+2. `FORCE_REFRESH(SHT20)`
+3. `GET_SNAPSHOT`
+4. 更新应用状态
+5. 生成带时间戳的输出文件名
+6. 从摄像头抓取一帧原始 NV12 数据
+7. 调用 `ffmpeg` 转成 JPG
+8. 删除中间 `.yuv`
+9. 更新最近抓拍状态
+10. 追加写入 `events.log`
 
 这个流程把“传感器上下文”和“图像证据”绑定在一起，是一个很完整的事件链。
 
@@ -368,6 +402,8 @@ trigger
 
 - 主线程负责状态和模式调度
 - worker 线程负责高频图像处理
+
+另外，`trigger` 模式现在也会每秒刷新一次 snapshot。这样网页上的 `pir` 和 `buzzer_active` 会在硬件状态恢复后自动回落，不会只在“下一次 PIR 触发”时才更新。
 
 ## 5. MJPEG 推流链路
 
@@ -453,6 +489,7 @@ monitor worker 发布新 JPEG 后会：
 - 立即刷新
 - 查看当前模式
 - 查看 PIR 状态
+- 查看蜂鸣器状态
 - 查看温度、湿度
 - 查看最近事件时间
 - 查看抓拍状态
@@ -496,7 +533,7 @@ monitor worker 发布新 JPEG 后会：
 
 下面这些内容在代码中还属于“已预留或可优化”，不建议在简历里夸大成“已经完成”：
 
-- 蜂鸣器还未接入
+- 已接入单路 PWM 蜂鸣器，但当前告警策略仍然比较简单，主要是固定时长/固定节奏提醒
 - SHT20 阈值字段已保留，但尚未形成阈值告警逻辑
 - HTTP 服务是最小实现，没有认证、鉴权和完整协议解析
 - 日志接口当前只读取固定大小缓冲区

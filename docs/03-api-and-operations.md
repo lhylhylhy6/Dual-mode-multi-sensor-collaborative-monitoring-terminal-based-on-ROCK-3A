@@ -51,6 +51,7 @@ sensor_hub.ko
 - `sensor_hub_core.o`
 - `sensor_hub_pir.o`
 - `sensor_hub_sht20.o`
+- `sensor_hub_buzzer.o`
 
 ## 3.2 编译设备树 overlay
 
@@ -66,6 +67,12 @@ dtc -@ -I dts -O dtb -o sensor-hub.dtbo sensor-hub-overlay.dts
 ```text
 sensor-hub.dtbo
 ```
+
+说明：
+
+- overlay 已经按当前接线写死了 `PWM9_M0 / PIN18`
+- `sensor-hub.dtbo` 负责描述 `pwms = <&pwm9 0 416667 0>` 和蜂鸣器默认参数
+- 板端还需要在 `rsetup` 里额外启用官方 overlay `rk3568-pwm9-m0`，这样 PWM9 的 pinmux 才会真正生效
 
 ## 3.3 编译用户态守护进程
 
@@ -109,7 +116,8 @@ gcc -O2 -Wall \
 - 查看 `GET_INFO`
 - 查看 `GET_SNAPSHOT`
 - 手动触发 `FORCE_REFRESH(SHT20)`
-- 等待 PIR 事件
+- 手动触发一次蜂鸣器 `ALERT`
+- 等待 PIR 与蜂鸣器输出事件
 
 ## 4. 启动顺序
 
@@ -123,7 +131,12 @@ gcc -O2 -Wall \
 sudo rsetup
 ```
 
-把 `sensor-hub.dtbo` 作为第三方 overlay 加载，并重启开发板。
+需要做两件事：
+
+- 在官方 overlay 里启用 `rk3568-pwm9-m0`
+- 把 `sensor-hub.dtbo` 作为第三方 overlay 加载
+
+完成后重启开发板。
 
 ### 4.2 加载驱动
 
@@ -181,6 +194,8 @@ GET /api/status
 | --- | --- |
 | `mode` | 当前模式，`monitor` 或 `trigger` |
 | `pir` | 当前 PIR 电平 |
+| `buzzer_active` | 蜂鸣器是否正在鸣叫 |
+| `buzzer_freq_hz` | 当前蜂鸣器频率，单位 `Hz` |
 | `temperature` | 当前温度，单位 `°C` |
 | `humidity` | 当前湿度，单位 `%RH` |
 | `last_image` | 最近一张抓拍图片相对路径 |
@@ -194,6 +209,8 @@ GET /api/status
 {
   "mode": "monitor",
   "pir": 0,
+  "buzzer_active": 0,
+  "buzzer_freq_hz": 2400,
   "temperature": 23.74,
   "humidity": 54.94,
   "last_image": "output/snap_20260415_094444_1920x1080_nv12.jpg",
@@ -273,6 +290,7 @@ HTTP 服务会做基础路径安全检查，不允许带 `..` 的路径。
 当前最重要的事件来源是：
 
 - PIR 中断事件
+- 蜂鸣器输出状态变化事件（`ALERT` / `OUTPUT_OFF`）
 
 ## 6.2 `ioctl`
 
@@ -284,15 +302,23 @@ HTTP 服务会做基础路径安全检查，不允许带 `..` 的路径。
 - `SH_IOC_FORCE_REFRESH`
 - `SH_IOC_GET_SENSOR_CFG`
 - `SH_IOC_SET_SENSOR_CFG`
+- `SH_IOC_RUN_ACTION`
 
-## 6.3 传感器 ID
+其中 `SH_IOC_RUN_ACTION` 当前已经用于蜂鸣器：
+
+- `SH_ACTION_ALERT`
+- `SH_ACTION_PULSE`
+- `SH_ACTION_STOP`
+
+## 6.3 端点 ID
 
 当前已经实现：
 
 - `SH_SENSOR_PIR = 1`
 - `SH_SENSOR_SHT20 = 2`
+- `SH_SENSOR_BUZZER = 6`
 
-协议里还为将来的其他传感器留了扩展空间。
+协议里还为将来的其他输入/输出端点留了扩展空间。
 
 ## 7. 输出文件说明
 
@@ -317,13 +343,13 @@ output/events.log
 格式：
 
 ```text
-时间 MODE=trigger PIR=1 TEMP=xx.xxC HUMI=xx.xx%RH IMG=output/xxx.jpg
+时间 MODE=trigger PIR=1 BUZZER=1 TEMP=xx.xxC HUMI=xx.xx%RH IMG=output/xxx.jpg
 ```
 
 示例：
 
 ```text
-2026-04-15 10:25:23 MODE=trigger PIR=1 TEMP=23.55C HUMI=55.49%RH IMG=output/snap_20260415_102521_1920x1080_nv12.jpg
+2026-04-15 10:25:23 MODE=trigger PIR=1 BUZZER=1 TEMP=23.55C HUMI=55.49%RH IMG=output/snap_20260415_102521_1920x1080_nv12.jpg
 ```
 
 ## 8. 调试建议
@@ -369,6 +395,14 @@ output/events.log
 - `output/` 是否有写权限
 - 摄像头抓帧是否成功
 
+### 现象：蜂鸣器已经停了，但网页还显示在响；或者 PIR 已经回到 0，网页还停在 1
+
+优先检查：
+
+- 当前运行的 `monitor_daemon` 是否已经包含 trigger 模式每秒同步 snapshot 的修复
+- `/api/status` 里的 `snapshot_seq` 是否在 `trigger` 模式下持续递增
+- 是否仍在运行旧二进制
+
 ### 现象：温湿度总是 0
 
 优先检查：
@@ -388,7 +422,7 @@ output/events.log
 1. 展示 `hub_test` 能拿到 snapshot，说明内核驱动和用户态通信是通的
 2. 启动 `monitor` 模式，展示网页实时视频和温湿度状态
 3. 切到 `trigger` 模式，现场触发 PIR
-4. 展示新生成的 JPG 和新增日志
+4. 展示蜂鸣器提醒、PIR 状态自动回落，以及新生成的 JPG 和新增日志
 5. 再解释为什么要做双模式，而不是只做一个模式
 
 这个顺序最能体现项目的完整性。

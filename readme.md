@@ -9,12 +9,13 @@
 - **Raspberry Pi Camera Module v2**：用于实时视频预览与抓拍
 - **HC-SR501 PIR 人体红外传感器**：用于人体触发检测
 - **SHT20 温湿度传感器**：用于采集环境温湿度
+- **PWM 无源蜂鸣器**：用于触发时的本地声音提醒
 - **Web 控制台**：用于查看状态、实时画面、日志，并切换工作模式
 
 当前系统包含两种运行模式：
 
 - **monitor 模式**：网页端实时查看视频画面，并显示当前传感器值
-- **trigger 模式**：PIR 触发后抓拍、读取 SHT20、记录事件日志
+- **trigger 模式**：PIR 触发后鸣笛提醒、抓拍、读取 SHT20、记录事件日志
 
 ---
 
@@ -28,6 +29,7 @@
 
 2. **trigger 模式**
    - 等待 PIR 触发
+   - 触发后先鸣笛提醒
    - 触发后读取 SHT20
    - 抓拍并保存 JPG 图片
    - 追加写入 `events.log`
@@ -47,13 +49,14 @@
 - **摄像头**：Raspberry Pi Camera Module 2
 - **PIR 传感器**：HC-SR501
 - **温湿度传感器**：SHT20（I2C）
-- **当前未接入**：蜂鸣器
+- **无源蜂鸣器**：已支持通过 PWM 接入 `sensor_hub`
 
 ### 当前连接信息
 
 - Camera：CSI，用户态可通过 `/dev/video0` 访问
 - SHT20：挂载在 `/dev/i2c-2`，设备地址 `0x40`
 - PIR：已接入 `sensor_hub` 驱动，不再使用 `libgpiod` 作为正式方案
+- Buzzer：接在 `PWM9_M0 / PIN18`，需要同时启用 `sensor-hub.dtbo` 与 `rk3568-pwm9-m0`
 
 ---
 
@@ -67,10 +70,11 @@
 
 - `/dev/sensor_hub`
 
-当前已接入两个传感器：
+当前已接入两个输入端点和一个输出端点：
 
 - `SH_SENSOR_PIR`
 - `SH_SENSOR_SHT20`
+- `SH_SENSOR_BUZZER`
 
 支持以下能力：
 
@@ -82,6 +86,7 @@
   - `SH_IOC_FORCE_REFRESH`
   - `SH_IOC_GET_SENSOR_CFG`
   - `SH_IOC_SET_SENSOR_CFG`
+  - `SH_IOC_RUN_ACTION`
 
 ---
 
@@ -111,6 +116,7 @@
 
 - 查看当前模式
 - 查看 PIR 状态
+- 查看蜂鸣器状态
 - 查看温度、湿度
 - 查看最近事件时间
 - 查看最近抓拍状态
@@ -133,7 +139,8 @@ kernel/
     ├── sensor_hub.h                # 通用结构体定义
     ├── sensor_hub_core.c           # hub 核心实现
     ├── sensor_hub_pir.c            # PIR 驱动接入
-    └── sensor_hub_sht20.c          # SHT20 驱动接入
+    ├── sensor_hub_sht20.c          # SHT20 驱动接入
+    └── sensor_hub_buzzer.c         # PWM 蜂鸣器驱动接入
 
 user/
 ├── daemon/
@@ -187,6 +194,7 @@ readme.md
 - `GET_SNAPSHOT` 正常
 - `FORCE_REFRESH(SHT20)` 正常
 - PIR 事件流正常
+- `RUN_ACTION(BUZZER)` 正常
 
 ### 6.5 用户态 daemon
 
@@ -196,11 +204,12 @@ readme.md
 当前 `trigger` 模式逻辑为：
 
 1. 等待 PIR 事件
-2. `FORCE_REFRESH SHT20`
-3. 获取 snapshot
-4. 抓拍
-5. 转 JPG
-6. 写入 `output/events.log`
+2. `RUN_ACTION(BUZZER, ALERT)`
+3. `FORCE_REFRESH SHT20`
+4. 获取 snapshot
+5. 抓拍
+6. 转 JPG
+7. 写入 `output/events.log`
 
 ### 6.6 Web 控制台
 
@@ -228,7 +237,7 @@ readme.md
 
 - 周期性更新当前传感器状态
 - 网页端显示实时视频预览
-- 网页端显示当前温湿度、PIR 状态、最近状态信息
+- 网页端显示当前温湿度、PIR、蜂鸣器状态和最近状态信息
 
 ### 推荐实现链路
 
@@ -271,6 +280,7 @@ V4L2 连续采集 NV12
 功能：
 
 - 等待 PIR 触发
+- 触发后蜂鸣器提醒
 - 触发后刷新 SHT20 数据
 - 获取 snapshot
 - 抓拍并保存 JPG
@@ -280,6 +290,7 @@ V4L2 连续采集 NV12
 
 ```text
 PIR 触发
+ -> RUN_ACTION(BUZZER, ALERT)
  -> FORCE_REFRESH(SHT20)
  -> GET_SNAPSHOT
  -> 抓拍一张图片
@@ -292,6 +303,7 @@ PIR 触发
 - 更关注“事件发生时的高质量抓拍”
 - 可以继续保留 `1920x1080` 单帧抓拍逻辑
 - 不需要承担 monitor 模式的实时视频压力
+- 即使没有新触发，也会每秒同步一次 snapshot，保证网页上的 PIR/蜂鸣器状态及时回落
 
 ------
 
@@ -309,6 +321,8 @@ GET /api/status
 {
   "mode": "monitor",
   "pir": 0,
+  "buzzer_active": 0,
+  "buzzer_freq_hz": 2400,
   "temperature": 25.60,
   "humidity": 48.20,
   "last_image": "output/snap_20260409_203000_1920x1080_nv12.jpg",
@@ -433,6 +447,12 @@ sudo rsetup
 sensor-hub.dtbo
 ```
 
+如果你使用的是当前文档里的蜂鸣器接线，还需要在官方 overlay 里启用：
+
+```text
+rk3568-pwm9-m0
+```
+
 之后重启开发板。
 
 ------
@@ -514,7 +534,7 @@ http://<开发板IP>:8080/
 ## 12. 日志示例
 
 ```text
-2026-04-09 20:30:00 MODE=trigger PIR=1 TEMP=25.60C HUMI=48.20%RH IMG=output/snap_20260409_203000_1920x1080_nv12.jpg
+2026-04-09 20:30:00 MODE=trigger PIR=1 BUZZER=1 TEMP=25.60C HUMI=48.20%RH IMG=output/snap_20260409_203000_1920x1080_nv12.jpg
 ```
 
 ------
@@ -568,7 +588,7 @@ ls -l /dev/sensor_hub
    - 模式状态提示
    - 自动重连
    - 抓拍历史列表
-3. 增加蜂鸣器联动
+3. 增加更多输出联动策略（蜂鸣器节奏、告警分级等）
 4. 增加事件保留策略与日志轮转
 5. 增加更细粒度的传感器配置接口
 
@@ -578,15 +598,11 @@ ls -l /dev/sensor_hub
 
 当前项目已经具备完整的基础能力：
 
-- sensor_hub 驱动已接入 PIR 与 SHT20
-- trigger 模式已可用
+- sensor_hub 驱动已接入两个输入端点和一个 PWM 输出端点
+- trigger 模式已支持蜂鸣器提醒、抓拍与日志留痕
 - monitor 模式已具备网页预览能力
-- Web 控制台已可查看状态、日志、图像并切换模式
+- Web 控制台已可查看状态、日志、图像并切换模式，且 trigger 模式状态会持续同步
 
 下一阶段的重点是：
 
 **在不推翻现有 `sensor_hub + monitor_daemon + web` 架构的前提下，把 monitor 模式的视频链路优化为真正可用的高帧率实时预览。**
-
-```
-如果你要，我下一条可以继续直接把它整理成更偏“课程设计/毕业设计风格”的 README 版本。
-```

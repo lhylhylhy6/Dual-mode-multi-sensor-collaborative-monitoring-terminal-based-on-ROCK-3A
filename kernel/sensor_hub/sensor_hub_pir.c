@@ -8,29 +8,28 @@ struct sh_pir_priv {
 	struct gpio_desc *gpiod;
 	int irq;
 	s64 last_irq_ns;
-	struct sh_sensor *sensor;
+	struct sh_endpoint *endpoint;
 };
 
 static irqreturn_t sh_pir_irq_thread(int irq, void *data)
 {
 	struct sh_core *hub = data;
-	struct sh_sensor *sensor = sh_find_sensor(hub, SH_SENSOR_PIR);
+	struct sh_endpoint *endpoint = sh_find_endpoint(hub, SH_SENSOR_PIR);
 	struct sh_pir_priv *priv;
 	struct sh_sensor_value val;
-	struct sh_event evt;
 	s64 now;
 	int level;
 	u32 debounce_ms;
 
-	if (!sensor)
+	if (!endpoint)
 		return IRQ_HANDLED;
 
-	priv = sensor->priv;
-	if (!priv || !sensor->cfg.enabled)
+	priv = endpoint->priv;
+	if (!priv || !endpoint->cfg.enabled)
 		return IRQ_HANDLED;
 
 	now = ktime_get_ns();
-	debounce_ms = sensor->cfg.debounce_ms;
+	debounce_ms = endpoint->cfg.debounce_ms;
 
 	if (debounce_ms &&
 	    priv->last_irq_ns &&
@@ -44,33 +43,23 @@ static irqreturn_t sh_pir_irq_thread(int irq, void *data)
 
 	priv->last_irq_ns = now;
 
-	memset(&val, 0, sizeof(val));
-	val.id = SH_SENSOR_PIR;
-	val.type = SH_TYPE_BINARY;
-	val.flags = SH_FLAG_ENABLED | SH_FLAG_VALID | SH_FLAG_ONLINE;
-	val.nvalues = 1;
+	sh_init_value(endpoint, &val,
+		      SH_FLAG_ENABLED | SH_FLAG_VALID | SH_FLAG_ONLINE,
+		      1);
 	val.timestamp_ns = now;
 	val.values[0] = level;
 
-	sh_update_sensor_value(hub, sensor, &val);
-
-	memset(&evt, 0, sizeof(evt));
-	evt.type = SH_EVT_SENSOR;
-	evt.sensor_id = SH_SENSOR_PIR;
-	evt.code = level ? SH_CODE_TRIGGER : SH_CODE_FALLING;
-	evt.flags = SH_FLAG_VALID;
-	evt.nvalues = 1;
-	evt.timestamp_ns = now;
-	evt.values[0] = level;
-
-	sh_push_event(hub, &evt);
+	sh_update_endpoint_value(hub, endpoint, &val);
+	sh_emit_event(hub, endpoint, SH_EVT_SENSOR,
+		      level ? SH_CODE_TRIGGER : SH_CODE_FALLING,
+		      val.flags, &val);
 
 	return IRQ_HANDLED;
 }
 
-static int sh_pir_refresh(struct sh_core *hub, struct sh_sensor *sensor)
+static int sh_pir_refresh(struct sh_core *hub, struct sh_endpoint *endpoint)
 {
-	struct sh_pir_priv *priv = sensor->priv;
+	struct sh_pir_priv *priv = endpoint->priv;
 	struct sh_sensor_value val;
 	int level;
 
@@ -78,34 +67,46 @@ static int sh_pir_refresh(struct sh_core *hub, struct sh_sensor *sensor)
 	if (level < 0)
 		return level;
 
-	memset(&val, 0, sizeof(val));
-	val.id = SH_SENSOR_PIR;
-	val.type = SH_TYPE_BINARY;
-	val.flags = SH_FLAG_ENABLED | SH_FLAG_VALID | SH_FLAG_ONLINE;
-	val.nvalues = 1;
-	val.timestamp_ns = ktime_get_ns();
+	sh_init_value(endpoint, &val,
+		      (endpoint->cfg.enabled ? SH_FLAG_ENABLED : 0) |
+		      SH_FLAG_VALID | SH_FLAG_ONLINE,
+		      1);
 	val.values[0] = level;
 
-	sh_update_sensor_value(hub, sensor, &val);
+	sh_update_endpoint_value(hub, endpoint, &val);
 	return 0;
 }
 
 static int sh_pir_apply_cfg(struct sh_core *hub,
-			    struct sh_sensor *sensor,
+			    struct sh_endpoint *endpoint,
 			    const struct sh_sensor_cfg *cfg)
 {
+	struct sh_sensor_value val;
+
 	mutex_lock(&hub->lock);
-	sensor->cfg.enabled = cfg->enabled;
-	sensor->cfg.debounce_ms = cfg->debounce_ms;
+	endpoint->cfg.enabled = cfg->enabled;
+	endpoint->cfg.debounce_ms = cfg->debounce_ms;
 	mutex_unlock(&hub->lock);
+
+	val = endpoint->value;
+	val.flags &= ~SH_FLAG_ENABLED;
+	if (cfg->enabled)
+		val.flags |= SH_FLAG_ENABLED;
+	val.timestamp_ns = ktime_get_ns();
+	sh_update_endpoint_value(hub, endpoint, &val);
+	sh_emit_event(hub, endpoint, SH_EVT_CONFIG,
+		      cfg->enabled ? SH_CODE_ENABLE : SH_CODE_DISABLE,
+		      val.flags, &val);
 	return 0;
 }
 
-static void sh_pir_remove_sensor(struct sh_core *hub, struct sh_sensor *sensor)
+static void sh_pir_remove_sensor(struct sh_core *hub, struct sh_endpoint *endpoint)
 {
+	(void)hub;
+	(void)endpoint;
 }
 
-static const struct sh_sensor_ops sh_pir_ops = {
+static const struct sh_endpoint_ops sh_pir_ops = {
 	.refresh   = sh_pir_refresh,
 	.apply_cfg = sh_pir_apply_cfg,
 	.remove    = sh_pir_remove_sensor,
@@ -114,8 +115,8 @@ static const struct sh_sensor_ops sh_pir_ops = {
 int sh_pir_register(struct sh_core *hub)
 {
 	struct sh_pir_priv *priv;
-	struct sh_sensor tmpl = { 0 };
-	struct sh_sensor *sensor;
+	struct sh_endpoint tmpl = { 0 };
+	struct sh_endpoint *endpoint;
 	struct sh_sensor_value val;
 	int ret, level;
 
@@ -134,6 +135,8 @@ int sh_pir_register(struct sh_core *hub)
 	memset(&tmpl, 0, sizeof(tmpl));
 	tmpl.id = SH_SENSOR_PIR;
 	tmpl.type = SH_TYPE_BINARY;
+	tmpl.direction = SH_DIR_INPUT;
+	tmpl.caps = SH_CAP_REFRESH | SH_CAP_CFG | SH_CAP_EVENT;
 	strscpy(tmpl.name, "pir", sizeof(tmpl.name));
 	tmpl.cfg.id = SH_SENSOR_PIR;
 	tmpl.cfg.enabled = 1;
@@ -141,25 +144,22 @@ int sh_pir_register(struct sh_core *hub)
 	tmpl.ops = &sh_pir_ops;
 	tmpl.priv = priv;
 
-	sensor = sh_register_sensor(hub, &tmpl);
-	if (!sensor)
+	endpoint = sh_register_endpoint(hub, &tmpl);
+	if (!endpoint)
 		return -ENOMEM;
 
-	priv->sensor = sensor;
+	priv->endpoint = endpoint;
 
 	level = gpiod_get_value_cansleep(priv->gpiod);
 	if (level < 0)
 		level = 0;
 
-	memset(&val, 0, sizeof(val));
-	val.id = SH_SENSOR_PIR;
-	val.type = SH_TYPE_BINARY;
-	val.flags = SH_FLAG_ENABLED | SH_FLAG_VALID | SH_FLAG_ONLINE;
-	val.nvalues = 1;
-	val.timestamp_ns = ktime_get_ns();
+	sh_init_value(endpoint, &val,
+		      SH_FLAG_ENABLED | SH_FLAG_VALID | SH_FLAG_ONLINE,
+		      1);
 	val.values[0] = level;
 
-	sh_update_sensor_value(hub, sensor, &val);
+	sh_update_endpoint_value(hub, endpoint, &val);
 
 	ret = devm_request_threaded_irq(hub->dev,
 					priv->irq,
@@ -179,4 +179,5 @@ int sh_pir_register(struct sh_core *hub)
 
 void sh_pir_unregister(struct sh_core *hub)
 {
+	sh_unregister_endpoint(hub, sh_find_endpoint(hub, SH_SENSOR_PIR));
 }

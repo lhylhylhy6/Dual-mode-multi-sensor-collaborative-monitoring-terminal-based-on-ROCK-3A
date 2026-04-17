@@ -19,25 +19,30 @@
 #define SH_EVT_Q_SIZE 64
 
 struct sh_core;
-struct sh_sensor;
+struct sh_endpoint;
 
-struct sh_sensor_ops {
-	int (*refresh)(struct sh_core *hub, struct sh_sensor *sensor);
+struct sh_endpoint_ops {
+	int (*refresh)(struct sh_core *hub, struct sh_endpoint *endpoint);
 	int (*apply_cfg)(struct sh_core *hub,
-			 struct sh_sensor *sensor,
+			 struct sh_endpoint *endpoint,
 			 const struct sh_sensor_cfg *cfg);
-	void (*remove)(struct sh_core *hub, struct sh_sensor *sensor);
+	int (*dispatch)(struct sh_core *hub,
+			struct sh_endpoint *endpoint,
+			const struct sh_action_req *req);
+	void (*remove)(struct sh_core *hub, struct sh_endpoint *endpoint);
 };
 
-struct sh_sensor {
+struct sh_endpoint {
 	__u32 id;
 	__u32 type;
+	__u32 direction;
+	__u32 caps;
 	char name[SH_NAME_LEN];
 
 	struct sh_sensor_value value;
 	struct sh_sensor_cfg cfg;
 
-	const struct sh_sensor_ops *ops;
+	const struct sh_endpoint_ops *ops;
 	void *priv;
 	bool registered;
 };
@@ -60,20 +65,31 @@ struct sh_core {
 
 	struct sh_event_queue q;
 
-	struct sh_sensor sensors[SH_MAX_SENSORS];
-	u32 sensor_count;
+	struct sh_endpoint endpoints[SH_MAX_SENSORS];
+	u32 endpoint_count;
 
 	u64 event_seq;
 	u64 snapshot_seq;
 };
 
 /* core helpers */
-struct sh_sensor *sh_find_sensor(struct sh_core *hub, u32 id);
-struct sh_sensor *sh_register_sensor(struct sh_core *hub,
-				     const struct sh_sensor *tmpl);
+struct sh_endpoint *sh_find_endpoint(struct sh_core *hub, u32 id);
+struct sh_endpoint *sh_register_endpoint(struct sh_core *hub,
+					 const struct sh_endpoint *tmpl);
+void sh_unregister_endpoint(struct sh_core *hub, struct sh_endpoint *endpoint);
 int sh_push_event(struct sh_core *hub, struct sh_event *evt);
-void sh_update_sensor_value(struct sh_core *hub,
-			    struct sh_sensor *sensor,
+void sh_init_value(struct sh_endpoint *endpoint,
+		   struct sh_sensor_value *val,
+		   u32 flags,
+		   u32 nvalues);
+void sh_emit_event(struct sh_core *hub,
+		   struct sh_endpoint *endpoint,
+		   u32 evt_type,
+		   u32 code,
+		   u32 evt_flags,
+		   const struct sh_sensor_value *val);
+void sh_update_endpoint_value(struct sh_core *hub,
+			      struct sh_endpoint *endpoint,
 			    const struct sh_sensor_value *val);
 void sh_fill_snapshot(struct sh_core *hub, struct sh_snapshot *snap);
 
@@ -83,5 +99,8 @@ void sh_pir_unregister(struct sh_core *hub);
 
 int sh_sht20_register(struct sh_core *hub);
 void sh_sht20_unregister(struct sh_core *hub);
+
+int sh_buzzer_register(struct sh_core *hub);
+void sh_buzzer_unregister(struct sh_core *hub);
 
 #endif

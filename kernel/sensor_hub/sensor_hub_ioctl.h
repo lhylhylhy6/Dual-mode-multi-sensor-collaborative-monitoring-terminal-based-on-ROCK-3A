@@ -31,7 +31,7 @@ extern "C" {
 /* =========================
  * API version / basic limits
  * ========================= */
-#define SH_API_VERSION            0x00010000U
+#define SH_API_VERSION            0x00020000U
 
 #define SH_MAX_VALUES             4
 #define SH_MAX_SENSORS            16
@@ -44,6 +44,7 @@ extern "C" {
 #define SH_SENSOR_NONE            0U
 #define SH_SENSOR_PIR             1U
 #define SH_SENSOR_SHT20           2U
+#define SH_SENSOR_BUZZER          6U
 
 /* Reserved future examples */
 #define SH_SENSOR_LIGHT           3U
@@ -61,7 +62,21 @@ extern "C" {
 #define SH_TYPE_ENV               2U   /* environmental, e.g. temp/humidity */
 #define SH_TYPE_ANALOG            3U
 #define SH_TYPE_COUNTER           4U
+#define SH_TYPE_PWM               5U   /* pwm-driven output, e.g. passive buzzer */
 #define SH_TYPE_CUSTOM            100U
+
+/* =========================
+ * Directions / capabilities
+ * ========================= */
+#define SH_DIR_NONE               0U
+#define SH_DIR_INPUT              1U
+#define SH_DIR_OUTPUT             2U
+#define SH_DIR_BIDIR              3U
+
+#define SH_CAP_REFRESH            (1U << 0)
+#define SH_CAP_CFG                (1U << 1)
+#define SH_CAP_EVENT              (1U << 2)
+#define SH_CAP_ACTION             (1U << 3)
 
 /* =========================
  * Common flags
@@ -72,6 +87,7 @@ extern "C" {
 #define SH_FLAG_ALARM_HI          (1U << 3)
 #define SH_FLAG_ALARM_LO          (1U << 4)
 #define SH_FLAG_ERROR             (1U << 5)
+#define SH_FLAG_ACTIVE            (1U << 6)
 
 /* =========================
  * Event types
@@ -81,6 +97,7 @@ extern "C" {
 #define SH_EVT_CONFIG             2U   /* config changed */
 #define SH_EVT_ERROR              3U   /* driver/sensor error */
 #define SH_EVT_OVERFLOW           4U   /* event queue overflow */
+#define SH_EVT_OUTPUT             5U   /* output/actuator state changed */
 
 /* =========================
  * Event codes
@@ -97,6 +114,17 @@ extern "C" {
 #define SH_CODE_REFRESH           7U   /* force refresh */
 #define SH_CODE_ERROR             8U
 #define SH_CODE_QUEUE_DROPPED     9U
+#define SH_CODE_OUTPUT_ON         10U
+#define SH_CODE_OUTPUT_OFF        11U
+#define SH_CODE_ALERT             12U
+
+/* =========================
+ * Action types
+ * ========================= */
+#define SH_ACTION_NONE            0U
+#define SH_ACTION_STOP            1U
+#define SH_ACTION_PULSE           2U
+#define SH_ACTION_ALERT           3U
 
 /* Sensor-specific semantics:
  *
@@ -106,6 +134,12 @@ extern "C" {
  * SHT20:
  *   values[0] = temperature in mC
  *   values[1] = humidity in m%RH
+ *
+ * BUZZER:
+ *   values[0] = active (0/1)
+ *   values[1] = frequency in Hz
+ *   values[2] = duration in ms
+ *   values[3] = duty cycle in permille (0-1000)
  */
 
 /* =========================
@@ -119,13 +153,15 @@ extern "C" {
 struct sh_sensor_value {
     __u32 id;                           /* SH_SENSOR_* */
     __u32 type;                         /* SH_TYPE_* */
+    __u32 direction;                    /* SH_DIR_* */
     __u32 flags;                        /* SH_FLAG_* */
+    __u32 caps;                         /* SH_CAP_* */
     __u32 nvalues;                      /* number of valid entries in values[] */
 
     __s64 timestamp_ns;                 /* last update time */
 
     __s32 values[SH_MAX_VALUES];        /* scaled integer values */
-    __u32 reserved[SH_RESERVED_WORDS];
+    __u32 reserved[SH_RESERVED_WORDS - 2];
 };
 
 /*
@@ -185,10 +221,19 @@ struct sh_event {
  * SHT20:
  *   enabled
  *   period_ms
+ *   params[0] = default output freq / reserved
+ *   params[1] = default duty permille / reserved
+ *   params[2] = default duration ms / reserved
  *   thresh_hi[0] = temp_hi_mC     (optional)
  *   thresh_lo[0] = temp_lo_mC     (optional)
  *   thresh_hi[1] = humi_hi_mRH    (optional)
  *   thresh_lo[1] = humi_lo_mRH    (optional)
+ *
+ * BUZZER:
+ *   enabled
+ *   params[0] = default tone frequency in Hz
+ *   params[1] = default duty cycle in permille (0-1000)
+ *   params[2] = default pulse duration in ms
  */
 struct sh_sensor_cfg {
     __u32 id;                           /* SH_SENSOR_* */
@@ -197,6 +242,7 @@ struct sh_sensor_cfg {
     __u32 period_ms;                    /* polling period for periodic sensors */
     __u32 debounce_ms;                  /* debounce for edge sensors */
 
+    __s32 params[SH_MAX_VALUES];        /* device-specific params */
     __s32 thresh_hi[SH_MAX_VALUES];     /* high thresholds */
     __s32 thresh_lo[SH_MAX_VALUES];     /* low thresholds */
 
@@ -214,18 +260,39 @@ struct sh_refresh_req {
 };
 
 /*
+ * Unified output action request.
+ *
+ * BUZZER:
+ *   action = SH_ACTION_ALERT or SH_ACTION_PULSE
+ *   duration_ms = pulse length, 0 = use cfg default
+ *   values[0] = frequency in Hz, 0 = use cfg default
+ *   values[1] = duty cycle in permille, 0 = use cfg default
+ */
+struct sh_action_req {
+    __u32 id;                           /* SH_SENSOR_* */
+    __u32 action;                       /* SH_ACTION_* */
+    __u32 duration_ms;                  /* 0 = use cfg default */
+    __u32 nvalues;                      /* valid entries in values[] */
+
+    __s32 values[SH_MAX_VALUES];
+    __u32 reserved[SH_RESERVED_WORDS];
+};
+
+/*
  * Basic driver metadata.
  */
 struct sh_hub_info {
     __u32 version;                      /* SH_API_VERSION */
-    __u32 sensor_count;                 /* currently registered sensors */
+    __u32 sensor_count;                 /* currently registered endpoints */
+    __u32 input_count;                  /* endpoints with input capability */
+    __u32 output_count;                 /* endpoints with output capability */
     __u32 queue_size;                   /* event queue capacity */
     __u32 queue_depth;                  /* current queued events */
 
     __u64 event_seq;                    /* latest event seq */
     __u64 snapshot_seq;                 /* latest snapshot seq */
 
-    __u32 reserved[SH_RESERVED_WORDS];
+    __u32 reserved[SH_RESERVED_WORDS - 2];
 };
 
 /* =========================
@@ -270,6 +337,15 @@ struct sh_hub_info {
 
 /* Set one sensor config */
 #define SH_IOC_SET_SENSOR_CFG     _IOW(SH_IOC_MAGIC, 0x06, struct sh_sensor_cfg)
+
+/* Dispatch one output action, e.g. passive buzzer pulse */
+#define SH_IOC_RUN_ACTION         _IOW(SH_IOC_MAGIC, 0x07, struct sh_action_req)
+
+/* Generic aliases for mixed input/output endpoints */
+#define SH_IOC_REFRESH            SH_IOC_FORCE_REFRESH
+#define SH_IOC_GET_CFG            SH_IOC_GET_SENSOR_CFG
+#define SH_IOC_SET_CFG            SH_IOC_SET_SENSOR_CFG
+#define SH_IOC_DO_ACTION          SH_IOC_RUN_ACTION
 
 #ifdef __cplusplus
 }

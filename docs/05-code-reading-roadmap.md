@@ -20,14 +20,15 @@
 4. `kernel/sensor_hub/sensor_hub_core.c`
 5. `kernel/sensor_hub/sensor_hub_pir.c`
 6. `kernel/sensor_hub/sensor_hub_sht20.c`
-7. `user/daemon/include/*.h`
-8. `user/daemon/sensor_client.c`
-9. `user/daemon/camera_v4l2.c`
-10. `user/daemon/app_state.c`
-11. `user/daemon/http_server.c`
-12. `user/daemon/main.c`
-13. `user/daemon/hub_test.c`
-14. `user/web/index.html`
+7. `kernel/sensor_hub/sensor_hub_buzzer.c`
+8. `user/daemon/include/*.h`
+9. `user/daemon/sensor_client.c`
+10. `user/daemon/camera_v4l2.c`
+11. `user/daemon/app_state.c`
+12. `user/daemon/http_server.c`
+13. `user/daemon/main.c`
+14. `user/daemon/hub_test.c`
+15. `user/web/index.html`
 
 这个顺序的原则是：
 
@@ -43,11 +44,11 @@
 
 你读这一份文件时，不要急着看代码细节，先回答下面几个问题：
 
-1. 驱动向用户态暴露了哪些命令
-2. 什么是 `sh_event`
-3. 什么是 `sh_snapshot`
-4. 为什么传感器值要用定点整数
-5. 现在已有哪些 `sensor id`
+1. 驱动向用户态暴露了哪些命令：`read / poll / ioctl`
+2. 什么是 `sh_event`：`read/poll` 返回的事件，当前主要由 PIR 和蜂鸣器输出状态变化产生
+3. 什么是 `sh_snapshot`：所有端点的最新值，统一保存在结构体里，通过 `ioctl` 返回给用户态
+4. 为什么传感器值要用定点整数：内核共享 ABI 更稳定，也能避免浮点和精度陷阱
+5. 现在已有哪些 `sensor id`：当前已经落地的是 `PIR / SHT20 / BUZZER`，另外还预留了 `LIGHT / SMOKE / DOOR` 等扩展 ID。
 
 重点关注这些结构体：
 
@@ -59,7 +60,7 @@
 
 读完这一份头文件后，你应该能用自己的话说出：
 
-> 这个系统是怎么把“传感器状态”和“传感器事件”分别建模的。
+> 这个系统是怎么把“端点状态”“事件流”和“动作接口”分别建模的。
 
 ## 3.2 `sensor_hub.h`
 
@@ -67,16 +68,16 @@
 
 重点看：
 
-- `struct sh_sensor_ops`
-- `struct sh_sensor`
+- `struct sh_endpoint_ops`
+- `struct sh_endpoint`
 - `struct sh_event_queue`
 - `struct sh_core`
 
 你要理解的关键点是：
 
-- 一个传感器在驱动里是怎样被抽象的
-- `core` 为什么既要有 `lock` 又要有事件队列
-- PIR 和 SHT20 为什么都能复用同一套框架
+- 一个端点在驱动里是怎样被抽象的：通过 `sh_endpoint` 抽象，包含 ID、类型、方向、能力、配置、值、操作等参数。
+- `core` 为什么既要有 `lock` 又要有事件队列：前者保护注册表、配置和 snapshot，后者承担异步事件投递
+- PIR、SHT20 和 BUZZER 为什么都能复用同一套框架
 
 ## 4. 第二轮阅读：先吃透内核驱动
 
@@ -175,6 +176,23 @@
 - 为什么初始化时既要“马上 refresh 一次”，又要“启动 delayed_work”
 - `FORCE_REFRESH` 和周期采样分别适用于什么场景
 - 为什么当前 SHT20 只更新 snapshot，不往事件队列里推 sample 事件
+
+## 4.4 `sensor_hub_buzzer.c`
+
+这份文件建议从“输出端点是怎么被统一纳入框架的”这个角度看。
+
+重点函数：
+
+- `sh_buzzer_apply_cfg()`
+- `sh_buzzer_dispatch()`
+- `sh_buzzer_stop_workfn()`
+- `sh_buzzer_register()`
+
+阅读时重点问自己：
+
+- `RUN_ACTION` 是怎么一路落到 PWM 配置上的
+- 为什么输出端点也要维护 snapshot
+- `ALERT/PULSE/STOP` 的事件语义是什么
 
 ## 5. 第三轮阅读：吃透用户态基础模块
 
@@ -328,7 +346,8 @@
 这就是事件模式最核心的业务闭环：
 
 ```text
-FORCE_REFRESH(SHT20)
+RUN_ACTION(BUZZER, ALERT)
+  -> FORCE_REFRESH(SHT20)
   -> GET_SNAPSHOT
   -> camera_capture_one()
   -> ffmpeg 转 JPG
@@ -392,10 +411,10 @@ camera_dequeue()
 如果你读完一轮源码，建议你尝试不看文档回答下面这些问题：
 
 1. `/dev/sensor_hub` 为什么同时提供 `event` 和 `snapshot`
-2. PIR 触发后，SHT20 数据是怎么和抓拍结果绑定到一起的
+2. PIR 触发后，SHT20 数据和蜂鸣器状态是怎么和抓拍结果绑定到一起的
 3. monitor 模式为什么不直接把 NV12 文件落盘给网页读
 4. 为什么模式切换必须重开摄像头
-5. `FORCE_REFRESH(SHT20)` 和周期采样分别解决什么问题
+5. `FORCE_REFRESH(SHT20)`、蜂鸣器动作以及周期采样分别解决什么问题
 6. 如果以后新增一个烟雾传感器，大概应该接到哪一层
 
 如果这些问题你能顺畅回答，说明你已经从“知道代码在哪”进入到“真正理解系统设计”了。

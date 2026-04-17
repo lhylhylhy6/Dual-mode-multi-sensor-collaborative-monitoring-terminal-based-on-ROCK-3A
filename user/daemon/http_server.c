@@ -81,6 +81,29 @@ static int snapshot_get_sht20(const struct sh_snapshot *snap, float *temp_c, flo
     return -1;
 }
 
+static int snapshot_get_buzzer(const struct sh_snapshot *snap, int *active, int *freq_hz)
+{
+    unsigned int i;
+
+    if (!snap) {
+        return -1;
+    }
+
+    for (i = 0; i < snap->count; ++i) {
+        if (snap->items[i].id == SH_SENSOR_BUZZER && snap->items[i].nvalues >= 1) {
+            if (active) {
+                *active = snap->items[i].values[0];
+            }
+            if (freq_hz) {
+                *freq_hz = snap->items[i].nvalues >= 2 ? snap->items[i].values[1] : 0;
+            }
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
 static int send_all(int fd, const void *buf, size_t len)
 {
     const unsigned char *p = (const unsigned char *)buf;
@@ -218,17 +241,22 @@ static void handle_status(int fd)
     app_state_t copy;
     char body[2048];
     int pir = 0;
+    int buzzer_active = 0;
+    int buzzer_freq_hz = 0;
     float temp = 0.0f;
     float humi = 0.0f;
 
     app_state_copy(g_ctx.state, &copy);
     snapshot_get_pir_level(&copy.last_snapshot, &pir);
     snapshot_get_sht20(&copy.last_snapshot, &temp, &humi);
+    snapshot_get_buzzer(&copy.last_snapshot, &buzzer_active, &buzzer_freq_hz);
 
     snprintf(body, sizeof(body),
              "{"
              "\"mode\":\"%s\","
              "\"pir\":%d,"
+             "\"buzzer_active\":%d,"
+             "\"buzzer_freq_hz\":%d,"
              "\"temperature\":%.2f,"
              "\"humidity\":%.2f,"
              "\"last_image\":\"%s\","
@@ -238,6 +266,8 @@ static void handle_status(int fd)
              "}",
              app_mode_to_str(copy.mode),
              pir,
+             buzzer_active,
+             buzzer_freq_hz,
              temp,
              humi,
              copy.last_image_path,

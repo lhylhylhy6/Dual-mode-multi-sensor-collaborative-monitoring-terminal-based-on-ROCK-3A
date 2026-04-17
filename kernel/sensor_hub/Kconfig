@@ -1,5 +1,5 @@
 config SENSOR_HUB
 	tristate "Sensor hub driver"
-	depends on GPIOLIB && I2C
+	depends on GPIOLIB && I2C && PWM
 	help
-	  Unified sensor hub driver for PIR + SHT20 and future sensors.
+	  Unified hub driver for PIR + SHT20 inputs and PWM-driven outputs.

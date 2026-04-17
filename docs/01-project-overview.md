@@ -28,6 +28,7 @@
 - 摄像头：Raspberry Pi Camera Module v2
 - 人体红外传感器：HC-SR501 PIR
 - 温湿度传感器：SHT20，挂在 `i2c-2`，地址 `0x40`
+- 无源蜂鸣器：接在 `PWM9_M0 / PIN18`，通过 `sensor_hub` 作为 PWM 输出端点统一管理
 
 代码中还保留了后续继续扩展更多传感器的空间，例如：
 
@@ -42,22 +43,23 @@
 
 | 层级 | 位置 | 主要职责 | 关键技术 |
 | --- | --- | --- | --- |
-| 内核态 | `kernel/sensor_hub` | 统一管理 PIR 与 SHT20，提供事件流和快照接口 | Linux 平台驱动、字符设备、GPIO IRQ、I2C、`ioctl/read/poll` |
+| 内核态 | `kernel/sensor_hub` | 统一管理输入/输出端点，当前接入 PIR、SHT20 与 PWM 蜂鸣器 | Linux 平台驱动、字符设备、GPIO IRQ、I2C、PWM、`ioctl/read/poll` |
 | 用户态 | `user/daemon` | 读取传感器、管理摄像头、切换模式、抓拍、写日志、提供 HTTP 服务 | C、V4L2、pthread、socket、TurboJPEG、`ffmpeg` |
 | 前端 | `user/web/index.html` | 查看状态、切换模式、显示实时预览和抓拍结果 | HTML、CSS、原生 JavaScript |
 
 ## 5. 核心设计思想
 
-### 5.1 统一传感器入口
+### 5.1 统一端点入口
 
-项目没有让用户态分别直接操作 GPIO、I2C 等硬件接口，而是通过一个统一字符设备 `/dev/sensor_hub` 提供访问能力。这样用户态只需要学习一套协议：
+项目没有让用户态分别直接操作 GPIO、I2C、PWM 等硬件接口，而是通过一个统一字符设备 `/dev/sensor_hub` 提供访问能力。这样用户态只需要学习一套协议：
 
 - `read/poll`：读事件
 - `ioctl(GET_SNAPSHOT)`：读当前快照
 - `ioctl(FORCE_REFRESH)`：主动刷新某个传感器
 - `ioctl(GET/SET_SENSOR_CFG)`：读写配置
+- `ioctl(RUN_ACTION)`：触发输出动作，例如蜂鸣器 `alert/pulse/stop`
 
-这对于后续增加新传感器非常重要，因为用户态接口可以保持稳定。
+这对于后续增加新输入或输出端点都很重要，因为用户态接口可以保持稳定。
 
 ### 5.2 双模式分工
 
@@ -70,12 +72,13 @@
 
 ### 5.3 事件流和状态快照并存
 
-项目同时维护两种数据访问方式：
+项目同时维护两种状态/控制方式：
 
 - 事件流：适合 `trigger` 模式，靠 PIR 中断触发
 - 状态快照：适合 `monitor` 模式，周期读取全部传感器状态
+- 动作接口：适合蜂鸣器这类输出端点，由用户态显式触发
 
-这比只做轮询更合理，也比只做事件更完整。
+这比只做轮询更合理，也比只做事件更完整，也让驱动从“统一输入”自然扩展到了“统一输入/输出”。
 
 ## 6. 两种模式的端到端链路
 
@@ -111,6 +114,7 @@
 PIR GPIO 中断
   -> sensor_hub 生成 PIR 事件
   -> 用户态 poll/read 收到事件
+  -> RUN_ACTION(BUZZER, ALERT)
   -> FORCE_REFRESH SHT20
   -> GET_SNAPSHOT 读取事件时刻的传感器快照
   -> /dev/video0 抓一帧 NV12 原始图像
@@ -120,7 +124,9 @@ PIR GPIO 中断
   -> Web 页面可查看最新抓拍结果
 ```
 
-这个模式下系统更像一个事件录像/抓拍终端。
+同时，`trigger` 模式下用户态也会每秒刷新一次 snapshot，这样网页上的 PIR 电平和蜂鸣器状态能在事件结束后自动回落，不会长期停在旧值。
+
+这个模式下系统更像一个带提醒能力的事件录像/抓拍终端。
 
 ## 7. 当前已经实现到什么程度
 
@@ -129,11 +135,12 @@ PIR GPIO 中断
 - 自定义内核驱动可工作
 - PIR 已通过 GPIO 中断进入统一驱动
 - SHT20 已通过 I2C 接入统一驱动
+- 无源蜂鸣器已通过 PWM9_M0 接入统一驱动
 - 用户态可通过共享头文件访问驱动协议
 - 摄像头采集已打通
 - monitor 模式的 MJPEG 预览已实现
-- trigger 模式的抓拍和日志已实现
-- 网页控制台已支持模式切换、状态查看、日志查看和图像查看
+- trigger 模式的蜂鸣器提醒、抓拍和日志已实现
+- 网页控制台已支持模式切换、状态查看、蜂鸣器状态查看、日志查看和图像查看
 
 ## 8. 项目产出物
 
@@ -147,7 +154,7 @@ PIR GPIO 中断
 示例日志如下：
 
 ```text
-2026-04-15 09:44:18 MODE=trigger PIR=1 TEMP=23.81C HUMI=56.16%RH IMG=output/snap_20260415_094416_1920x1080_nv12.jpg
+2026-04-15 09:44:18 MODE=trigger PIR=1 BUZZER=1 TEMP=23.81C HUMI=56.16%RH IMG=output/snap_20260415_094416_1920x1080_nv12.jpg
 ```
 
 ## 9. 为什么这个项目适合写进简历
@@ -171,4 +178,4 @@ PIR GPIO 中断
 
 可以这样介绍这个项目：
 
-> 这是一个运行在 ROCK 3A 上的嵌入式监控终端。我把 PIR 人体红外和 SHT20 温湿度传感器统一封装进一个自定义的 Linux `sensor_hub` 驱动，用户态通过 `/dev/sensor_hub` 统一读取事件和状态；同时用 V4L2 接入摄像头，实现了 `monitor` 模式下的 MJPEG 实时预览，以及 `trigger` 模式下基于 PIR 触发的抓拍、日志记录和 Web 可视化控制台。
+> 这是一个运行在 ROCK 3A 上的嵌入式监控终端。我把 PIR 人体红外、SHT20 温湿度传感器和 PWM 无源蜂鸣器统一封装进一个自定义的 Linux `sensor_hub` 驱动，抽象成输入/输出端点；用户态通过 `/dev/sensor_hub` 统一读取事件、快照并下发动作，同时用 V4L2 接入摄像头，实现了 `monitor` 模式下的 MJPEG 实时预览，以及 `trigger` 模式下基于 PIR 触发的提醒、抓拍、日志记录和 Web 可视化控制台。
